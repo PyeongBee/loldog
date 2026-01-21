@@ -4,7 +4,7 @@
 from ultralytics import YOLO
 
 # 2. 모델 로드 (yolov8n 또는 yolo11n 선택)
-model = YOLO("yolo11n.pt") # 자동으로 최신 가중치 다운로드됨
+model = YOLO("yolo26n.pt") # 자동으로 최신 가중치 다운로드됨
 
 # 3. ONNX로 내보내기
 # imgsz=[320, 320] -> 입력 크기 지정
