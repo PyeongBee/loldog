@@ -7,6 +7,7 @@ import {
   View,
   LayoutRectangle,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
@@ -31,12 +32,97 @@ type Detection = {
 
 const MODEL_ASSET = require("../assets/model/yolo11n.onnx");
 const INPUT_SIZE = 320; // YOLO 입력 크기 (가벼운 모델 권장)
-const CONF_THRESHOLD = 0.35;
+const CONF_THRESHOLD = 0.25;
 const NMS_THRESHOLD = 0.45;
+const AUTO_DETECT_INTERVAL_MS = 1200;
+
+const COCO_LABELS = [
+  "person",
+  "bicycle",
+  "car",
+  "motorcycle",
+  "airplane",
+  "bus",
+  "train",
+  "truck",
+  "boat",
+  "traffic light",
+  "fire hydrant",
+  "stop sign",
+  "parking meter",
+  "bench",
+  "bird",
+  "cat",
+  "dog",
+  "horse",
+  "sheep",
+  "cow",
+  "elephant",
+  "bear",
+  "zebra",
+  "giraffe",
+  "backpack",
+  "umbrella",
+  "handbag",
+  "tie",
+  "suitcase",
+  "frisbee",
+  "skis",
+  "snowboard",
+  "sports ball",
+  "kite",
+  "baseball bat",
+  "baseball glove",
+  "skateboard",
+  "surfboard",
+  "tennis racket",
+  "bottle",
+  "wine glass",
+  "cup",
+  "fork",
+  "knife",
+  "spoon",
+  "bowl",
+  "banana",
+  "apple",
+  "sandwich",
+  "orange",
+  "broccoli",
+  "carrot",
+  "hot dog",
+  "pizza",
+  "donut",
+  "cake",
+  "chair",
+  "couch",
+  "potted plant",
+  "bed",
+  "dining table",
+  "toilet",
+  "tv",
+  "laptop",
+  "mouse",
+  "remote",
+  "keyboard",
+  "cell phone",
+  "microwave",
+  "oven",
+  "toaster",
+  "sink",
+  "refrigerator",
+  "book",
+  "clock",
+  "vase",
+  "scissors",
+  "teddy bear",
+  "hair drier",
+  "toothbrush",
+];
 
 export default function DetectScreen() {
   const router = useRouter();
   const { champion } = useLocalSearchParams<{ champion?: string }>();
+  const insets = useSafeAreaInsets();
   const [permission, requestPermission] = useCameraPermissions();
   const [flash, setFlash] = useState(false);
   const [detections, setDetections] = useState<Detection[]>([]);
@@ -50,6 +136,8 @@ export default function DetectScreen() {
   const [status, setStatus] = useState("모델 준비 중...");
   const cameraRef = useRef<CameraView>(null);
   const flashTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isRunningRef = useRef(false);
 
   const championLabel = useMemo(
     () => (typeof champion === "string" ? champion : "선택되지 않음"),
@@ -65,12 +153,37 @@ export default function DetectScreen() {
   }, []);
 
   useEffect(() => {
+    isRunningRef.current = isRunning;
+  }, [isRunning]);
+
+  useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
       setDetections((prev) => prev.filter((d) => d.expiresAt > now));
     }, 400);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (autoInterval.current) {
+      clearInterval(autoInterval.current);
+      autoInterval.current = null;
+    }
+    if (!permission?.granted || !modelReady || !session || !ort) {
+      return;
+    }
+    autoInterval.current = setInterval(() => {
+      if (isRunningRef.current) return;
+      runYoloOnce();
+    }, AUTO_DETECT_INTERVAL_MS);
+
+    return () => {
+      if (autoInterval.current) {
+        clearInterval(autoInterval.current);
+        autoInterval.current = null;
+      }
+    };
+  }, [permission?.granted, modelReady, session, ort]);
 
   useEffect(() => {
     const prepareModel = async () => {
@@ -132,13 +245,14 @@ export default function DetectScreen() {
       return;
     }
     setIsRunning(true);
-    setStatus("1회 감지 중...");
+    setStatus("자동 감지 중...");
 
     try {
       const photo = await cameraRef.current.takePictureAsync({
         quality: 0.4,
         base64: true,
         skipProcessing: true,
+        shutterSound: false,
       });
       if (!photo.base64) {
         setStatus("캡처 실패");
@@ -167,6 +281,7 @@ export default function DetectScreen() {
       const dets = parseYoloOutput(output.data as Float32Array, output.dims, {
         inputSize: INPUT_SIZE,
         confThreshold: CONF_THRESHOLD,
+        labels: COCO_LABELS,
       });
       const finalDets = nonMaxSuppression(dets, NMS_THRESHOLD);
 
@@ -247,22 +362,21 @@ export default function DetectScreen() {
           ))}
       </View>
 
-      <View style={styles.actions}>
-        <Pressable
+      <View style={[styles.actions, { paddingBottom: 16 + insets.bottom }]}>
+        <View
           style={[
             styles.primaryButton,
-            (!modelReady || isModelLoading || isRunning) && styles.primaryButtonDisabled,
+            (!modelReady || isModelLoading) && styles.primaryButtonDisabled,
           ]}
-          onPress={runYoloOnce}
-          disabled={!modelReady || isModelLoading || isRunning}
         >
           <Text style={styles.primaryLabel}>
-            {isRunning ? "감지 중..." : modelReady ? "YOLO 1회 감지" : "모델 준비 중"}
+            {!modelReady || isModelLoading
+              ? "모델 준비 중"
+              : isRunning
+                ? "자동 감지 중..."
+                : "자동 감지 대기"}
           </Text>
-        </Pressable>
-        <Pressable style={styles.secondaryButton} onPress={triggerMockDetection}>
-          <Text style={styles.secondaryLabel}>모의 감지(랜덤)</Text>
-        </Pressable>
+        </View>
         <Pressable style={styles.secondaryButton} onPress={() => router.back()}>
           <Text style={styles.secondaryLabel}>다시 선택</Text>
         </Pressable>
@@ -306,34 +420,44 @@ async function buildInputTensor(ort: OrtModule, base64: string, size: number): P
 function parseYoloOutput(
   data: Float32Array,
   dims: readonly number[] | undefined,
-  opts: { inputSize: number; confThreshold: number }
+  opts: { inputSize: number; confThreshold: number; labels?: string[] }
 ) {
   const detections: Omit<Detection, "id" | "expiresAt">[] = [];
   if (!dims || dims.length < 3) {
     return detections;
   }
-  const [batch, anchors, features] = dims;
+  const [batch, dim1, dim2] = dims;
   if (batch !== 1) return detections;
-  const stride = features ?? 85;
+  const featuresFirst = dim1 <= 100 && dim2 > 1000;
+  const anchors = featuresFirst ? dim2 : dim1;
+  const features = featuresFirst ? dim1 : dim2;
+  const hasObjectness = features >= 85;
+  const classStart = hasObjectness ? 5 : 4;
+  const numClasses = features - classStart;
+  if (numClasses <= 0) return detections;
+
+  const getValue = (anchorIdx: number, featureIdx: number) =>
+    featuresFirst ? data[featureIdx * anchors + anchorIdx] : data[anchorIdx * features + featureIdx];
+
   for (let i = 0; i < anchors; i++) {
-    const offset = i * stride;
-    const obj = data[offset + 4];
+    const obj = hasObjectness ? getValue(i, 4) : 1;
     if (obj < opts.confThreshold) continue;
     let bestCls = 0;
     let bestScore = 0;
-    for (let c = 5; c < stride; c++) {
-      const clsScore = data[offset + c];
+    for (let c = 0; c < numClasses; c++) {
+      const clsScore = getValue(i, classStart + c);
       if (clsScore > bestScore) {
         bestScore = clsScore;
-        bestCls = c - 5;
+        bestCls = c;
       }
     }
     const score = obj * bestScore;
     if (score < opts.confThreshold) continue;
-    const cx = data[offset];
-    const cy = data[offset + 1];
-    const w = data[offset + 2];
-    const h = data[offset + 3];
+    const cx = getValue(i, 0);
+    const cy = getValue(i, 1);
+    const w = getValue(i, 2);
+    const h = getValue(i, 3);
+    if (!Number.isFinite(cx + cy + w + h)) continue;
     const x = (cx - w / 2) / opts.inputSize;
     const y = (cy - h / 2) / opts.inputSize;
     detections.push({
@@ -342,7 +466,7 @@ function parseYoloOutput(
       w: w / opts.inputSize,
       h: h / opts.inputSize,
       score,
-      label: `cls${bestCls}`,
+      label: opts.labels?.[bestCls] ?? `cls${bestCls}`,
     });
   }
   return detections;
