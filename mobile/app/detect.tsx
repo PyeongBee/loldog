@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -9,7 +9,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { CameraView, useCameraPermissions } from "expo-camera";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { useRouter } from "expo-router";
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
 import { Asset } from "expo-asset";
 import jpeg from "jpeg-js";
@@ -30,98 +30,18 @@ type Detection = {
   expiresAt: number;
 };
 
-const MODEL_ASSET = require("../assets/model/yolo11n.onnx");
-const INPUT_SIZE = 320; // YOLO 입력 크기 (가벼운 모델 권장)
-const CONF_THRESHOLD = 0.25;
-const NMS_THRESHOLD = 0.45;
+const MODEL_ASSET = require("../assets/model/after_train_leesin_11n_best.onnx");
+const INPUT_SIZE = 640; // YOLO 입력 크기 (가벼운 모델 권장)
+const CONF_THRESHOLD = 0.013;
+const NMS_THRESHOLD = 0.6;
+const MAX_DETECTIONS = 15;
+const MIN_ACCEPT_SCORE = 0.03;
 const AUTO_DETECT_INTERVAL_MS = 1200;
 
-const COCO_LABELS = [
-  "person",
-  "bicycle",
-  "car",
-  "motorcycle",
-  "airplane",
-  "bus",
-  "train",
-  "truck",
-  "boat",
-  "traffic light",
-  "fire hydrant",
-  "stop sign",
-  "parking meter",
-  "bench",
-  "bird",
-  "cat",
-  "dog",
-  "horse",
-  "sheep",
-  "cow",
-  "elephant",
-  "bear",
-  "zebra",
-  "giraffe",
-  "backpack",
-  "umbrella",
-  "handbag",
-  "tie",
-  "suitcase",
-  "frisbee",
-  "skis",
-  "snowboard",
-  "sports ball",
-  "kite",
-  "baseball bat",
-  "baseball glove",
-  "skateboard",
-  "surfboard",
-  "tennis racket",
-  "bottle",
-  "wine glass",
-  "cup",
-  "fork",
-  "knife",
-  "spoon",
-  "bowl",
-  "banana",
-  "apple",
-  "sandwich",
-  "orange",
-  "broccoli",
-  "carrot",
-  "hot dog",
-  "pizza",
-  "donut",
-  "cake",
-  "chair",
-  "couch",
-  "potted plant",
-  "bed",
-  "dining table",
-  "toilet",
-  "tv",
-  "laptop",
-  "mouse",
-  "remote",
-  "keyboard",
-  "cell phone",
-  "microwave",
-  "oven",
-  "toaster",
-  "sink",
-  "refrigerator",
-  "book",
-  "clock",
-  "vase",
-  "scissors",
-  "teddy bear",
-  "hair drier",
-  "toothbrush",
-];
+const LEESIN_LABELS = ["Leesin"];
 
 export default function DetectScreen() {
   const router = useRouter();
-  const { champion } = useLocalSearchParams<{ champion?: string }>();
   const insets = useSafeAreaInsets();
   const [permission, requestPermission] = useCameraPermissions();
   const [flash, setFlash] = useState(false);
@@ -139,10 +59,7 @@ export default function DetectScreen() {
   const autoInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const isRunningRef = useRef(false);
 
-  const championLabel = useMemo(
-    () => (typeof champion === "string" ? champion : "선택되지 않음"),
-    [champion]
-  );
+  const championLabel = "Leesin";
 
   useEffect(() => {
     return () => {
@@ -278,12 +195,23 @@ export default function DetectScreen() {
       const results = await session.run(feeds);
       const outputName = session.outputNames[0];
       const output = results[outputName];
+      console.log("yolo output dims", output.dims);
+      const maxScore = getYoloMaxScore(
+        output.data as Float32Array,
+        output.dims,
+        LEESIN_LABELS.length
+      );
+      console.log("yolo max score", maxScore);
+      if (maxScore < MIN_ACCEPT_SCORE) {
+        setStatus("감지 없음");
+        return;
+      }
       const dets = parseYoloOutput(output.data as Float32Array, output.dims, {
         inputSize: INPUT_SIZE,
         confThreshold: CONF_THRESHOLD,
-        labels: COCO_LABELS,
+        labels: LEESIN_LABELS,
       });
-      const finalDets = nonMaxSuppression(dets, NMS_THRESHOLD);
+      const finalDets = nonMaxSuppression(dets, NMS_THRESHOLD).slice(0, MAX_DETECTIONS);
 
       if (finalDets.length > 0) {
         const now = Date.now();
@@ -431,13 +359,38 @@ function parseYoloOutput(
   const featuresFirst = dim1 <= 100 && dim2 > 1000;
   const anchors = featuresFirst ? dim2 : dim1;
   const features = featuresFirst ? dim1 : dim2;
-  const hasObjectness = features >= 85;
+  const labelsCount = opts.labels?.length ?? null;
+  const hasObjectness =
+    labelsCount !== null
+      ? features - 5 === labelsCount
+        ? true
+        : features - 4 === labelsCount
+          ? false
+          : features >= 5
+      : features >= 5;
   const classStart = hasObjectness ? 5 : 4;
   const numClasses = features - classStart;
   if (numClasses <= 0) return detections;
 
   const getValue = (anchorIdx: number, featureIdx: number) =>
     featuresFirst ? data[featureIdx * anchors + anchorIdx] : data[anchorIdx * features + featureIdx];
+
+  let coordScale = opts.inputSize;
+  const sampleCount = Math.min(anchors, 200);
+  let maxCoord = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const cx = getValue(i, 0);
+    const cy = getValue(i, 1);
+    const w = getValue(i, 2);
+    const h = getValue(i, 3);
+    if (cx > maxCoord) maxCoord = cx;
+    if (cy > maxCoord) maxCoord = cy;
+    if (w > maxCoord) maxCoord = w;
+    if (h > maxCoord) maxCoord = h;
+  }
+  if (maxCoord <= 1.5) {
+    coordScale = 1;
+  }
 
   for (let i = 0; i < anchors; i++) {
     const obj = hasObjectness ? getValue(i, 4) : 1;
@@ -458,18 +411,56 @@ function parseYoloOutput(
     const w = getValue(i, 2);
     const h = getValue(i, 3);
     if (!Number.isFinite(cx + cy + w + h)) continue;
-    const x = (cx - w / 2) / opts.inputSize;
-    const y = (cy - h / 2) / opts.inputSize;
+    const x = (cx - w / 2) / coordScale;
+    const y = (cy - h / 2) / coordScale;
     detections.push({
       x,
       y,
-      w: w / opts.inputSize,
-      h: h / opts.inputSize,
+      w: w / coordScale,
+      h: h / coordScale,
       score,
       label: opts.labels?.[bestCls] ?? `cls${bestCls}`,
     });
   }
   return detections;
+}
+
+function getYoloMaxScore(
+  data: Float32Array,
+  dims: readonly number[] | undefined,
+  labelsCount: number
+) {
+  if (!dims || dims.length < 3) return 0;
+  const [batch, dim1, dim2] = dims;
+  if (batch !== 1) return 0;
+  const featuresFirst = dim1 <= 100 && dim2 > 1000;
+  const anchors = featuresFirst ? dim2 : dim1;
+  const features = featuresFirst ? dim1 : dim2;
+  const hasObjectness =
+    features - 5 === labelsCount
+      ? true
+      : features - 4 === labelsCount
+        ? false
+        : features >= 5;
+  const classStart = hasObjectness ? 5 : 4;
+  const numClasses = features - classStart;
+  if (numClasses <= 0) return 0;
+
+  const getValue = (anchorIdx: number, featureIdx: number) =>
+    featuresFirst ? data[featureIdx * anchors + anchorIdx] : data[anchorIdx * features + featureIdx];
+
+  let maxScore = 0;
+  for (let i = 0; i < anchors; i++) {
+    const obj = hasObjectness ? getValue(i, 4) : 1;
+    let bestScore = 0;
+    for (let c = 0; c < numClasses; c++) {
+      const clsScore = getValue(i, classStart + c);
+      if (clsScore > bestScore) bestScore = clsScore;
+    }
+    const score = obj * bestScore;
+    if (score > maxScore) maxScore = score;
+  }
+  return maxScore;
 }
 
 function nonMaxSuppression(dets: Omit<Detection, "id" | "expiresAt">[], iouThresh: number) {

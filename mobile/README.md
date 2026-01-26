@@ -1,3 +1,15 @@
+adb kill-server
+
+adb reverse tcp:8081 tcp:8081
+adb reverse tcp:5173 tcp:5173
+
+adb reverse --list
+
+npx expo prebuild
+npx expo run:android
+
+수정 후 저장하고 나면 r (reload)
+
 # Welcome to your Expo app 👋
 
 This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
