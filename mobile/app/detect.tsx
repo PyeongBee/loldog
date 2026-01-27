@@ -11,13 +11,9 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { useRouter } from "expo-router";
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
-import { Asset } from "expo-asset";
 import jpeg from "jpeg-js";
 import { Buffer } from "buffer";
-
-type OrtModule = typeof import("onnxruntime-react-native");
-type OrtSession = Awaited<ReturnType<OrtModule["InferenceSession"]["create"]>>;
-type OrtTensor = InstanceType<OrtModule["Tensor"]>;
+import { loadTensorflowModel, TensorflowModel } from "react-native-fast-tflite";
 
 type Detection = {
   id: string;
@@ -30,13 +26,13 @@ type Detection = {
   expiresAt: number;
 };
 
-const MODEL_ASSET = require("../assets/model/after_train_leesin_11n_best.onnx");
+const MODEL_ASSET = require("../assets/model/11n_best_epoch300_train.tflite");
 const INPUT_SIZE = 640; // YOLO 입력 크기 (가벼운 모델 권장)
-const CONF_THRESHOLD = 0.013;
-const NMS_THRESHOLD = 0.6;
-const MAX_DETECTIONS = 15;
-const MIN_ACCEPT_SCORE = 0.03;
-const AUTO_DETECT_INTERVAL_MS = 1200;
+const CONF_THRESHOLD = 0.7;
+const NMS_THRESHOLD = 0.3;
+const MAX_DETECTIONS = 10;
+const MIN_ACCEPT_SCORE = 0.2;
+const AUTO_DETECT_INTERVAL_MS = 1000;
 
 const LEESIN_LABELS = ["Leesin"];
 
@@ -51,8 +47,7 @@ export default function DetectScreen() {
   const [isModelLoading, setIsModelLoading] = useState(false);
   const [modelInitTried, setModelInitTried] = useState(false);
   const [modelReady, setModelReady] = useState(false);
-  const [ort, setOrt] = useState<OrtModule | null>(null);
-  const [session, setSession] = useState<OrtSession | null>(null);
+  const [model, setModel] = useState<TensorflowModel | null>(null);
   const [status, setStatus] = useState("모델 준비 중...");
   const cameraRef = useRef<CameraView>(null);
   const flashTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -86,7 +81,7 @@ export default function DetectScreen() {
       clearInterval(autoInterval.current);
       autoInterval.current = null;
     }
-    if (!permission?.granted || !modelReady || !session || !ort) {
+    if (!permission?.granted || !modelReady || !model) {
       return;
     }
     autoInterval.current = setInterval(() => {
@@ -100,27 +95,19 @@ export default function DetectScreen() {
         autoInterval.current = null;
       }
     };
-  }, [permission?.granted, modelReady, session, ort]);
+  }, [permission?.granted, modelReady, model]);
 
   useEffect(() => {
     const prepareModel = async () => {
       if (modelInitTried || modelReady || isModelLoading) return;
       setModelInitTried(true);
       setIsModelLoading(true);
-      setStatus("모델 로딩 중...");
+      setStatus("TFLite 모델 로딩 중...");
       try {
-        // NOTE: onnxruntime-react-native는 import 시점에 네이티브(JNI/ObjC) 설치를 시도합니다.
-        // Expo Go 등 네이티브 모듈이 없는 환경에서는 여기서 실패하므로 동적 import로 감싸서 크래시를 방지합니다.
-        const ortModule = ort ?? (await import("onnxruntime-react-native"));
-        if (!ort) setOrt(ortModule);
-
-        const asset = Asset.fromModule(MODEL_ASSET);
-        await asset.downloadAsync(); // localUri 확보
-        const modelPath = asset.localUri ?? asset.uri;
-        const loadedSession = await ortModule.InferenceSession.create(modelPath, {
-          executionProviders: ["cpu"],
-        });
-        setSession(loadedSession);
+        const loadedModel = await loadTensorflowModel(MODEL_ASSET);
+        console.log("TFLite inputs", loadedModel.inputs);
+        console.log("TFLite outputs", loadedModel.outputs);
+        setModel(loadedModel);
         setModelReady(true);
         setStatus("모델 준비 완료");
       } catch (err) {
@@ -132,7 +119,7 @@ export default function DetectScreen() {
     };
 
     prepareModel();
-  }, [isModelLoading, modelReady, ort]);
+  }, [isModelLoading, modelReady, model]);
 
   const triggerMockDetection = () => {
     const now = Date.now();
@@ -155,10 +142,8 @@ export default function DetectScreen() {
   };
 
   const runYoloOnce = async () => {
-    if (!cameraRef.current || !session || !ort) {
-      setStatus(
-        !ort ? "onnxruntime 로딩 실패: Dev Client가 필요합니다." : "세션이 준비되지 않았습니다."
-      );
+    if (!cameraRef.current || !model) {
+      setStatus("TFLite 모델이 준비되지 않았습니다.");
       return;
     }
     setIsRunning(true);
@@ -177,9 +162,10 @@ export default function DetectScreen() {
       }
 
       // 입력 크기로 리사이즈 후 base64 획득
+      const inputSpec = getModelInputSpec(model, INPUT_SIZE);
       const resized = await manipulateAsync(
         photo.uri,
-        [{ resize: { width: INPUT_SIZE, height: INPUT_SIZE } }],
+        [{ resize: { width: inputSpec.width, height: inputSpec.height } }],
         { base64: true, compress: 0.6, format: SaveFormat.JPEG }
       );
       if (!resized.base64) {
@@ -187,18 +173,28 @@ export default function DetectScreen() {
         return;
       }
 
-      const tensor = await buildInputTensor(ort, resized.base64, INPUT_SIZE);
-      const feeds: Record<string, OrtTensor> = {};
-      const inputName = session.inputNames[0];
-      feeds[inputName] = tensor;
-
-      const results = await session.run(feeds);
-      const outputName = session.outputNames[0];
-      const output = results[outputName];
-      console.log("yolo output dims", output.dims);
+      const inputBuffer = await buildInputBuffer(
+        resized.base64,
+        inputSpec.width,
+        inputSpec.height,
+        inputSpec.layout,
+        inputSpec.dataType
+      );
+      if (!inputBuffer || inputBuffer.length === 0) {
+        throw new Error("입력 버퍼가 비어 있습니다.");
+      }
+      const results = await model.run([inputBuffer]);
+      const output = results[0];
+      const outputDims = model.outputs?.[0]?.shape;
+      if (!(output instanceof Float32Array)) {
+        throw new Error(
+          `출력 타입이 Float32Array가 아닙니다: ${output?.constructor?.name ?? "unknown"}`
+        );
+      }
+      console.log("yolo output dims", outputDims);
       const maxScore = getYoloMaxScore(
-        output.data as Float32Array,
-        output.dims,
+        output,
+        outputDims,
         LEESIN_LABELS.length
       );
       console.log("yolo max score", maxScore);
@@ -206,8 +202,8 @@ export default function DetectScreen() {
         setStatus("감지 없음");
         return;
       }
-      const dets = parseYoloOutput(output.data as Float32Array, output.dims, {
-        inputSize: INPUT_SIZE,
+      const dets = parseYoloOutput(output, outputDims, {
+        inputSize: inputSpec.width,
         confThreshold: CONF_THRESHOLD,
         labels: LEESIN_LABELS,
       });
@@ -313,36 +309,93 @@ export default function DetectScreen() {
   );
 }
 
-async function buildInputTensor(ort: OrtModule, base64: string, size: number): Promise<OrtTensor> {
+type InputLayout = "NHWC" | "CHW";
+type InputDataType = TensorflowModel["inputs"][number]["dataType"];
+type InputSpec = {
+  width: number;
+  height: number;
+  layout: InputLayout;
+  dataType: InputDataType | undefined;
+};
+
+function getModelInputSpec(model: TensorflowModel, fallbackSize: number): InputSpec {
+  const shape = model.inputs?.[0]?.shape ?? [];
+  const isCHW = shape.length === 4 && shape[1] === 3;
+  const isNHWC = shape.length === 4 && shape[3] === 3;
+  const width = isNHWC ? shape[2] : isCHW ? shape[3] : fallbackSize;
+  const height = isNHWC ? shape[1] : isCHW ? shape[2] : fallbackSize;
+  const layout: InputLayout = isNHWC ? "NHWC" : "CHW";
+  const dataType = model.inputs?.[0]?.dataType;
+  return {
+    width: Number.isFinite(width) && width > 0 ? width : fallbackSize,
+    height: Number.isFinite(height) && height > 0 ? height : fallbackSize,
+    layout,
+    dataType,
+  };
+}
+
+async function buildInputBuffer(
+  base64: string,
+  width: number,
+  height: number,
+  layout: InputLayout,
+  dataType: InputDataType | undefined
+): Promise<Float32Array | Uint8Array> {
   const buffer = Buffer.from(base64, "base64");
   const decoded = jpeg.decode(buffer, { useTArray: true });
-  if (decoded.width !== size || decoded.height !== size) {
+  if (decoded.width !== width || decoded.height !== height) {
     throw new Error(`입력 크기 불일치: ${decoded.width}x${decoded.height}`);
   }
   const { data } = decoded; // RGBA
-  const floats = new Float32Array(size * size * 3);
+  const useFloat32 = dataType === "float32" || dataType === undefined;
+  const useUint8 = dataType === "uint8";
+  if (!useFloat32 && !useUint8) {
+    throw new Error(`지원하지 않는 입력 타입: ${dataType ?? "unknown"}`);
+  }
+
+  const floats = useFloat32 ? new Float32Array(width * height * 3) : null;
+  const bytes = useUint8 ? new Uint8Array(width * height * 3) : null;
   let di = 0;
   for (let i = 0; i < data.length; i += 4) {
-    const r = data[i] / 255;
-    const g = data[i + 1] / 255;
-    const b = data[i + 2] / 255;
-    floats[di++] = r;
-    floats[di++] = g;
-    floats[di++] = b;
-  }
-  // CHW
-  const chw = new Float32Array(size * size * 3);
-  const channelSize = size * size;
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const idx = (y * size + x) * 3;
-      const c = y * size + x;
-      chw[c] = floats[idx];
-      chw[c + channelSize] = floats[idx + 1];
-      chw[c + channelSize * 2] = floats[idx + 2];
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    if (useFloat32 && floats) {
+      floats[di++] = r / 255;
+      floats[di++] = g / 255;
+      floats[di++] = b / 255;
+    } else if (useUint8 && bytes) {
+      bytes[di++] = r;
+      bytes[di++] = g;
+      bytes[di++] = b;
     }
   }
-  return new ort.Tensor("float32", chw, [1, 3, size, size]);
+
+  if (layout === "NHWC") {
+    return (useFloat32 ? floats : bytes) as Float32Array | Uint8Array;
+  }
+
+  // CHW
+  const chw = useFloat32
+    ? new Float32Array(width * height * 3)
+    : new Uint8Array(width * height * 3);
+  const channelSize = width * height;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * 3;
+      const c = y * width + x;
+      if (useFloat32 && floats) {
+        (chw as Float32Array)[c] = floats[idx];
+        (chw as Float32Array)[c + channelSize] = floats[idx + 1];
+        (chw as Float32Array)[c + channelSize * 2] = floats[idx + 2];
+      } else if (useUint8 && bytes) {
+        (chw as Uint8Array)[c] = bytes[idx];
+        (chw as Uint8Array)[c + channelSize] = bytes[idx + 1];
+        (chw as Uint8Array)[c + channelSize * 2] = bytes[idx + 2];
+      }
+    }
+  }
+  return chw;
 }
 
 function parseYoloOutput(

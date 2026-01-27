@@ -5,17 +5,18 @@ import { useRouter } from "expo-router";
 type Champion = {
   id: string;
   name: string;
-  image?: string;
+  classId: number;
+  position: "Jungle" | "Top" | "Mid" | "Bottom" | "Support";
 };
 
 const CHAMPIONS: Champion[] = [
-  // { id: "ashe", name: "Ashe" },
-  // { id: "ahri", name: "Ahri" },
-  { id: "lee-sin", name: "Lee Sin" },
-  // { id: "lux", name: "Lux" },
-  // { id: "jinx", name: "Jinx" },
-  // { id: "zed", name: "Zed" },
-  { id: "vayne", name: "Vayne", image: require("../assets/images/vayne.jpg") },
+  { id: "Leesin", name: "리 신", classId: 0, position: "Jungle" },
+  // { id: "Nidalee", name: "니달리", classId: 1, position: "Jungle" },
+  // { id: "Elise", name: "엘리스", classId: 2, position: "Jungle" },
+  // { id: "JarvanIV", name: "자르반 4세", classId: 3, position: "Jungle" },
+  // { id: "Kindred", name: "킨드레드", classId: 4, position: "Jungle" },
+  // { id: "Kayn", name: "케인", classId: 5, position: "Jungle" },
+  // { id: "Lillia", name: "릴리아", classId: 6, position: "Jungle" },
 ];
 
 export default function HomeScreen() {
